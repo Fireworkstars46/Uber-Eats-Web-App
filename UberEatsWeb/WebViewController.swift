@@ -21,11 +21,23 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         }
       }
 
-      function isUberAppOrLoginURL(value) {
+      function currentHost() {
+        return String(window.location.hostname || '').toLowerCase();
+      }
+
+      function isInsideUberAuthentication() {
+        const host = currentHost();
+        return host === 'auth.uber.com' || host.endsWith('.auth.uber.com');
+      }
+
+      function isUberAppURL(value) {
         const url = normalize(value).toLowerCase();
-        return url.startsWith('uber:') ||
-               url.startsWith('ubereats:') ||
-               url.includes('auth.uber.com') ||
+        return url.startsWith('uber:') || url.startsWith('ubereats:');
+      }
+
+      function isUberWebLoginURL(value) {
+        const url = normalize(value).toLowerCase();
+        return url.includes('auth.uber.com') ||
                url.includes('signin_universal_link') ||
                url.includes('/login-redirect') ||
                url.includes('/login?') ||
@@ -58,18 +70,27 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
           text === 'log in' || text === 'login' || text === 'sign in' ||
           text.startsWith('log in ') || text.startsWith('sign in ');
 
-        if (isUberAppOrLoginURL(href) || looksLikeLoginButton) {
+        const mustBlockAppLink = isUberAppURL(href);
+        const mustStartWebLogin = !isInsideUberAuthentication() &&
+          (isUberWebLoginURL(href) || looksLikeLoginButton);
+
+        if (mustBlockAppLink || mustStartWebLogin) {
           event.preventDefault();
           event.stopPropagation();
           event.stopImmediatePropagation();
-          sendToNative(isUberAppOrLoginURL(href) ? href : '');
+          sendToNative((mustBlockAppLink || isUberWebLoginURL(href)) ? href : '');
         }
       }, true);
 
       document.addEventListener('submit', function (event) {
         const form = event.target;
         const action = form && form.action ? form.action : '';
-        if (isUberAppOrLoginURL(action)) {
+
+        // Never interfere with forms once the user is on auth.uber.com. Those forms
+        // are the phone/email, password, verification-code, and consent steps.
+        if (isInsideUberAuthentication()) return;
+
+        if (isUberAppURL(action) || isUberWebLoginURL(action)) {
           event.preventDefault();
           event.stopPropagation();
           event.stopImmediatePropagation();
@@ -79,7 +100,10 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
       const originalOpen = window.open;
       window.open = function (url) {
-        if (isUberAppOrLoginURL(url)) {
+        const mustBlockAppLink = isUberAppURL(url);
+        const mustStartWebLogin = !isInsideUberAuthentication() && isUberWebLoginURL(url);
+
+        if (mustBlockAppLink || mustStartWebLogin) {
           sendToNative(url);
           return null;
         }
@@ -89,6 +113,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
       function neutralizeAppLinks(root) {
         const scope = root && root.querySelectorAll ? root : document;
         scope.querySelectorAll('a[href^="uber:"], a[href^="ubereats:"]').forEach(function (link) {
+          link.setAttribute('data-blocked-uber-link', link.getAttribute('href') || '');
           link.setAttribute('href', '#');
           link.removeAttribute('target');
         });
@@ -231,6 +256,20 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         load(destination)
     }
 
+    private func isCurrentlyAuthenticating() -> Bool {
+        webView.url?.host?.lowercased() == "auth.uber.com"
+    }
+
+    private func handleBlockedUberAppLink() {
+        if isCurrentlyAuthenticating() {
+            // At the end of authentication Uber may try to return through its native app.
+            // The web session cookies should already exist, so return to the website instead.
+            loadHome()
+        } else {
+            loadWebLogin()
+        }
+    }
+
     private func updateButtons() {
         backButton.isEnabled = webView.canGoBack
         forwardButton.isEnabled = webView.canGoForward
@@ -269,8 +308,13 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         action.navigationType == .linkActivated || action.targetFrame == nil
     }
 
+    private func isUberAuthenticationHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        return host == "auth.uber.com" || host.hasSuffix(".auth.uber.com")
+    }
+
     private func webSafeURL(_ originalURL: URL) -> URL {
-        guard originalURL.host?.lowercased() == "auth.uber.com",
+        guard isUberAuthenticationHost(originalURL.host),
               var outer = URLComponents(url: originalURL, resolvingAgainstBaseURL: false),
               var outerItems = outer.queryItems else {
             return originalURL
@@ -306,9 +350,18 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         let raw = message.body as? String ?? ""
         let requestedURL = URL(string: raw)
+        let requestedScheme = requestedURL?.scheme?.lowercased() ?? ""
 
         DispatchQueue.main.async { [weak self] in
-            self?.loadWebLogin(requestedURL)
+            guard let self = self else { return }
+            if requestedScheme == "uber" || requestedScheme == "ubereats" {
+                self.handleBlockedUberAppLink()
+            } else if self.isCurrentlyAuthenticating() {
+                // Never restart an authentication flow that is already in progress.
+                return
+            } else {
+                self.loadWebLogin(requestedURL)
+            }
         }
     }
 
@@ -334,7 +387,15 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
                 return
             }
 
-            if isUserActivatedWebNavigation(navigationAction) {
+            let sourceIsAuth = isUberAuthenticationHost(webView.url?.host)
+            let destinationIsAuth = isUberAuthenticationHost(safeURL.host)
+            let enteringAuthentication = destinationIsAuth && !sourceIsAuth
+            let URLWasSanitized = safeURL != originalURL
+
+            // Only manually reload the initial jump into web authentication. Once the
+            // browser is on auth.uber.com, allow every form and next-step navigation.
+            if isUserActivatedWebNavigation(navigationAction) &&
+               (enteringAuthentication || URLWasSanitized) {
                 var request = navigationAction.request
                 request.url = safeURL
                 forcedWebNavigationKey = key
@@ -359,7 +420,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
         if scheme == "uber" || scheme == "ubereats" {
             DispatchQueue.main.async { [weak self] in
-                self?.loadWebLogin()
+                self?.handleBlockedUberAppLink()
             }
         } else if UIApplication.shared.canOpenURL(originalURL) {
             UIApplication.shared.open(originalURL)
@@ -399,7 +460,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         if navigationAction.targetFrame == nil, let originalURL = navigationAction.request.url {
             let scheme = originalURL.scheme?.lowercased() ?? ""
             if scheme == "uber" || scheme == "ubereats" {
-                loadWebLogin()
+                handleBlockedUberAppLink()
             } else {
                 var request = navigationAction.request
                 request.url = webSafeURL(originalURL)
