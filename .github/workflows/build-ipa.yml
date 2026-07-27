@@ -1,0 +1,143 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate app icons
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import struct, zlib, math
+
+          out = Path('UberEatsWeb/Assets.xcassets/AppIcon.appiconset')
+          out.mkdir(parents=True, exist_ok=True)
+
+          specs = {
+              'Icon-20@2x.png': 40,
+              'Icon-20@3x.png': 60,
+              'Icon-29@2x.png': 58,
+              'Icon-29@3x.png': 87,
+              'Icon-40@2x.png': 80,
+              'Icon-40@3x.png': 120,
+              'Icon-60@2x.png': 120,
+              'Icon-60@3x.png': 180,
+              'Icon-1024.png': 1024,
+          }
+
+          def chunk(kind, data):
+              return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+
+          def in_round_rect(x, y, left, top, right, bottom, radius):
+              if left + radius <= x <= right - radius and top <= y <= bottom:
+                  return True
+              if left <= x <= right and top + radius <= y <= bottom - radius:
+                  return True
+              for cx, cy in ((left+radius, top+radius), (right-radius, top+radius),
+                             (left+radius, bottom-radius), (right-radius, bottom-radius)):
+                  if (x-cx)**2 + (y-cy)**2 <= radius**2:
+                      return True
+              return False
+
+          def make_icon(path, size):
+              dark = (21, 23, 25)
+              green = (48, 190, 108)
+              white = (255, 255, 255)
+              rows = bytearray()
+
+              tile_l, tile_t = size * .07, size * .07
+              tile_r, tile_b = size * .93, size * .93
+              tile_rad = size * .18
+              bag_l, bag_t = size * .25, size * .36
+              bag_r, bag_b = size * .75, size * .77
+              bag_rad = size * .065
+              hc_x, hc_y = size * .50, size * .37
+              handle_outer = size * .17
+              handle_inner = size * .12
+
+              for y in range(size):
+                  rows.append(0)
+                  for x in range(size):
+                      color = dark
+                      if in_round_rect(x, y, tile_l, tile_t, tile_r, tile_b, tile_rad):
+                          color = green
+
+                      if in_round_rect(x, y, bag_l, bag_t, bag_r, bag_b, bag_rad):
+                          color = white
+
+                      d = math.hypot(x - hc_x, y - hc_y)
+                      if y <= hc_y and handle_inner <= d <= handle_outer:
+                          color = white
+
+                      # Dark WEB-like stripes on the bag for a simple original design.
+                      if bag_l + size*.09 <= x <= bag_r - size*.09:
+                          if size*.55 <= y <= size*.59 or size*.64 <= y <= size*.68:
+                              color = dark
+
+                      rows.extend(color)
+
+              raw = b'\x89PNG\r\n\x1a\n'
+              raw += chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0))
+              raw += chunk(b'IDAT', zlib.compress(bytes(rows), 9))
+              raw += chunk(b'IEND', b'')
+              path.write_bytes(raw)
+
+          for filename, size in specs.items():
+              make_icon(out / filename, size)
+          PY
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project UberEatsWeb.xcodeproj \
+            -scheme UberEatsWeb \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build
+
+          APP_PATH="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)"
+
+          if [[ -z "$APP_PATH" ]]; then
+            echo "The compiled app was not found."
+            exit 1
+          fi
+
+          rm -rf Payload Uber-Eats-Web-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry Uber-Eats-Web-unsigned.ipa Payload
+          ls -lh Uber-Eats-Web-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Uber-Eats-Web-unsigned
+          path: Uber-Eats-Web-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
