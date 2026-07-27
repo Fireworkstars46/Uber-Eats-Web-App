@@ -1,15 +1,109 @@
 import UIKit
 import WebKit
 
-final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private let homeURL = URL(string: "https://www.ubereats.com/")!
 
-    // Used only as a fallback when Uber tries to launch an uber:// or ubereats:// link.
     private let webLoginURL = URL(string: "https://auth.uber.com/v2/?localeCode=en-US&next_url=https%3A%2F%2Fwww.ubereats.com%2Flogin-redirect%2F%3Fredirect%3D%252F%26guest_mode%3Dfalse%26app_clip%3Dfalse")!
 
-    // A manually loaded request comes back through the navigation delegate once more.
-    // This key lets that second pass continue instead of creating a loop.
     private var forcedWebNavigationKey: String?
+
+    private static let loginInterceptorScript = #"""
+    (function () {
+      if (window.__uberEatsWebLoginInterceptorInstalled) return;
+      window.__uberEatsWebLoginInterceptorInstalled = true;
+
+      function normalize(value) {
+        try {
+          return new URL(String(value || ''), window.location.href).href;
+        } catch (_) {
+          return String(value || '');
+        }
+      }
+
+      function isUberAppOrLoginURL(value) {
+        const url = normalize(value).toLowerCase();
+        return url.startsWith('uber:') ||
+               url.startsWith('ubereats:') ||
+               url.includes('auth.uber.com') ||
+               url.includes('signin_universal_link') ||
+               url.includes('/login-redirect') ||
+               url.includes('/login?') ||
+               url.endsWith('/login');
+      }
+
+      function sendToNative(value) {
+        const url = normalize(value);
+        try {
+          window.webkit.messageHandlers.forceWebLogin.postMessage(url);
+        } catch (_) {}
+      }
+
+      function elementText(element) {
+        return String(
+          (element && (element.innerText || element.textContent || element.getAttribute('aria-label'))) || ''
+        ).trim().toLowerCase();
+      }
+
+      document.addEventListener('click', function (event) {
+        const target = event.target && event.target.closest
+          ? event.target.closest('a, button, [role="button"], [data-testid]')
+          : null;
+
+        if (!target) return;
+
+        const href = target.href || target.getAttribute('href') || target.getAttribute('data-href') || '';
+        const text = elementText(target);
+        const looksLikeLoginButton =
+          text === 'log in' || text === 'login' || text === 'sign in' ||
+          text.startsWith('log in ') || text.startsWith('sign in ');
+
+        if (isUberAppOrLoginURL(href) || looksLikeLoginButton) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          sendToNative(isUberAppOrLoginURL(href) ? href : '');
+        }
+      }, true);
+
+      document.addEventListener('submit', function (event) {
+        const form = event.target;
+        const action = form && form.action ? form.action : '';
+        if (isUberAppOrLoginURL(action)) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          sendToNative(action);
+        }
+      }, true);
+
+      const originalOpen = window.open;
+      window.open = function (url) {
+        if (isUberAppOrLoginURL(url)) {
+          sendToNative(url);
+          return null;
+        }
+        return originalOpen.apply(window, arguments);
+      };
+
+      function neutralizeAppLinks(root) {
+        const scope = root && root.querySelectorAll ? root : document;
+        scope.querySelectorAll('a[href^="uber:"], a[href^="ubereats:"]').forEach(function (link) {
+          link.setAttribute('href', '#');
+          link.removeAttribute('target');
+        });
+      }
+
+      neutralizeAppLinks(document);
+      new MutationObserver(function (mutations) {
+        mutations.forEach(function (mutation) {
+          mutation.addedNodes.forEach(function (node) {
+            neutralizeAppLinks(node);
+          });
+        });
+      }).observe(document.documentElement || document, { childList: true, subtree: true });
+    })();
+    """#
 
     private lazy var webView: WKWebView = {
         let config = WKWebViewConfiguration()
@@ -19,15 +113,20 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.defaultWebpagePreferences.preferredContentMode = .mobile
 
+        let userScript = WKUserScript(
+            source: Self.loginInterceptorScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+        config.userContentController.addUserScript(userScript)
+        config.userContentController.add(self, name: "forceWebLogin")
+
         let view = WKWebView(frame: .zero, configuration: config)
         view.translatesAutoresizingMaskIntoConstraints = false
         view.navigationDelegate = self
         view.uiDelegate = self
         view.allowsBackForwardNavigationGestures = true
         view.scrollView.keyboardDismissMode = .interactive
-
-        // Some sites treat a normal WKWebView as an embedded app browser and push users
-        // toward their native app. This identifies the wrapper as mobile Safari instead.
         view.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
         return view
     }()
@@ -48,8 +147,8 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private lazy var backButton = button("chevron.backward", #selector(goBack), "Back")
     private lazy var forwardButton = button("chevron.forward", #selector(goForward), "Forward")
     private lazy var homeButton = button("house", #selector(goHome), "Uber Eats home")
+    private lazy var loginButton = button("person.crop.circle", #selector(openWebLogin), "Web login")
     private lazy var reloadButton = button("arrow.clockwise", #selector(reloadPage), "Refresh")
-    private lazy var browserButton = button("safari", #selector(openInBrowser), "Open in browser")
 
     private var progressObservation: NSKeyValueObservation?
 
@@ -62,7 +161,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         view.addSubview(toolbar)
 
         let space = UIBarButtonItem(systemItem: .flexibleSpace)
-        toolbar.items = [backButton, space, forwardButton, space, homeButton, space, reloadButton, space, browserButton]
+        toolbar.items = [backButton, space, forwardButton, space, homeButton, space, loginButton, space, reloadButton]
 
         NSLayoutConstraint.activate([
             progressView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -98,6 +197,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     deinit {
         progressObservation?.invalidate()
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "forceWebLogin")
     }
 
     private func button(_ imageName: String, _ action: Selector, _ label: String) -> UIBarButtonItem {
@@ -109,6 +209,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private func load(_ url: URL) {
         var request = URLRequest(url: url)
         request.timeoutInterval = 60
+        request.cachePolicy = .reloadRevalidatingCacheData
         webView.load(request)
     }
 
@@ -116,14 +217,23 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         load(homeURL)
     }
 
-    private func loadWebLogin() {
-        load(webLoginURL)
+    private func loadWebLogin(_ requestedURL: URL? = nil) {
+        let destination: URL
+        if let requestedURL = requestedURL,
+           let scheme = requestedURL.scheme?.lowercased(),
+           scheme == "http" || scheme == "https" {
+            destination = webSafeURL(requestedURL)
+        } else {
+            destination = webLoginURL
+        }
+
+        forcedWebNavigationKey = destination.absoluteString
+        load(destination)
     }
 
     private func updateButtons() {
         backButton.isEnabled = webView.canGoBack
         forwardButton.isEnabled = webView.canGoForward
-        browserButton.isEnabled = webView.url != nil
     }
 
     @objc private func goBack() {
@@ -136,6 +246,10 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     @objc private func goHome() {
         loadHome()
+    }
+
+    @objc private func openWebLogin() {
+        loadWebLogin()
     }
 
     @objc private func reloadPage() {
@@ -151,11 +265,6 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         sender.endRefreshing()
     }
 
-    @objc private func openInBrowser() {
-        guard let url = webView.url else { return }
-        UIApplication.shared.open(url)
-    }
-
     private func isUserActivatedWebNavigation(_ action: WKNavigationAction) -> Bool {
         action.navigationType == .linkActivated || action.targetFrame == nil
     }
@@ -167,8 +276,6 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             return originalURL
         }
 
-        // Uber currently labels its website login return path as a universal link.
-        // Removing only that tracking flag keeps the return path as an ordinary webpage.
         for index in outerItems.indices where outerItems[index].name == "next_url" {
             guard let value = outerItems[index].value,
                   var nested = URLComponents(string: value) else {
@@ -176,13 +283,33 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             }
 
             nested.queryItems = nested.queryItems?.filter {
-                !($0.name == "campaign" && $0.value == "signin_universal_link")
+                !(($0.name == "campaign" && $0.value == "signin_universal_link") ||
+                  $0.name == "deep_link" ||
+                  $0.name == "app_link")
             }
             outerItems[index].value = nested.url?.absoluteString ?? value
         }
 
-        outer.queryItems = outerItems
+        outer.queryItems = outerItems.filter {
+            !(($0.name == "campaign" && $0.value == "signin_universal_link") ||
+              $0.name == "deep_link" ||
+              $0.name == "app_link")
+        }
         return outer.url ?? originalURL
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "forceWebLogin" else { return }
+
+        let raw = message.body as? String ?? ""
+        let requestedURL = URL(string: raw)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.loadWebLogin(requestedURL)
+        }
     }
 
     func webView(
@@ -201,15 +328,12 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
             let safeURL = webSafeURL(originalURL)
             let key = safeURL.absoluteString
 
-            // Allow the second pass generated by our manual webView.load call.
             if forcedWebNavigationKey == key {
                 forcedWebNavigationKey = nil
                 decisionHandler(.allow)
                 return
             }
 
-            // A user-tapped universal link can be handed to the installed Uber app.
-            // Cancel that tap and load the exact request ourselves so it remains web content.
             if isUserActivatedWebNavigation(navigationAction) {
                 var request = navigationAction.request
                 request.url = safeURL
@@ -234,8 +358,6 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         decisionHandler(.cancel)
 
         if scheme == "uber" || scheme == "ubereats" {
-            // Never hand an Uber deep link to the broken official app. Go to the real
-            // browser-based sign-in page instead.
             DispatchQueue.main.async { [weak self] in
                 self?.loadWebLogin()
             }
@@ -275,9 +397,14 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         if navigationAction.targetFrame == nil, let originalURL = navigationAction.request.url {
-            var request = navigationAction.request
-            request.url = webSafeURL(originalURL)
-            webView.load(request)
+            let scheme = originalURL.scheme?.lowercased() ?? ""
+            if scheme == "uber" || scheme == "ubereats" {
+                loadWebLogin()
+            } else {
+                var request = navigationAction.request
+                request.url = webSafeURL(originalURL)
+                webView.load(request)
+            }
         }
         return nil
     }
