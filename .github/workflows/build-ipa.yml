@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
@@ -84,7 +87,6 @@ jobs:
                       if y <= hc_y and handle_inner <= d <= handle_outer:
                           color = white
 
-                      # Dark WEB-like stripes on the bag for a simple original design.
                       if bag_l + size*.09 <= x <= bag_r - size*.09:
                           if size*.55 <= y <= size*.59 or size*.64 <= y <= size*.68:
                               color = dark
